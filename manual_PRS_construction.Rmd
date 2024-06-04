@@ -1,0 +1,206 @@
+---
+title: "--"
+author: "Ritah Nabunje"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### PRS Construction
+A polygenic risk score quantifies an individual's genetic risk for a disease based on the cumulative effect of multiple genetic variants.
+
+```{r include=FALSE}
+setwd("/scratch/gen1/rn180/respiratory_fibrosis/pf_phenotypes/manual_PRS")
+library(data.table)
+library(pROC)
+# files
+base="/scratch/gen1/rn180/respiratory_fibrosis/prs/reportedb37b.assoc"
+base="/scratch/gen1/rn180/respiratory_fibrosis/prs/reportedb37b.assoc"
+target="hypersensitivityPF_all_swapped.raw"
+pheno_file="../matching_controls/hypersensitivityPF_all_cases_controls.pheno"
+cov_file="../matching_controls/hypersensitivityPF_all_cases_controls.cov"
+# read
+base <- fread(base)
+genotypes <- fread(target)
+cov <-fread(cov_file)
+pheno <- fread(pheno_file)
+```
+#### Base Data
+The base dataset comprises of SNP identifiers, effect alleles, non-effect alleles, p-values, and odds ratios or betas derived from a large-scale genome-wide association study (GWAS). Here, the base data includes a few variants of interest.  
+```{r, echo=FALSE}
+base[, beta:=log(OR)] # beta from OR
+head(base)
+```
+
+#### Target Genotypes
+The target dataset included genotype data for the study population, formatted as PLINK binary files (BED, BIM, FAM).  
+
+#### SNP Extraction
+Relevant SNPs from the target dataset were extracted using PLINK, ensuring alignment with the SNPs listed in the base dataset. This step ensured that only the SNPs of interest were included in the analysis.  
+
+```{bash, echo=TRUE, eval=FALSE}
+plink --bfile target_genotypes --extract base_snps.txt --make-bed --out filtered_target_genotypes
+```
+#### Genotype Scoring
+Genotypes for each individual should be coded based on the number of effect alleles i.e, 0, 1, or 2. The target genotype data should be converted into a raw format using PLINK to facilitate subsequent calculations.  
+
+```{bash, echo=TRUE, eval=FALSE}
+plink --bfile filtered_target_genotypes --recode A --out genotypes
+```
+In the raw format, the variant is represented as the variant ID and corresponding effect allele. For each individual, the number of alleles is recorded as 0 for AA,1 for AG ,or 2 for GG if the variant is `"rsxx_G"` (see below).  
+
+```{r echo=FALSE}
+genotypes[1:6,1:9]
+```
+#### Alignment of Effect Alleles
+Alleles in the target dataset must be checked and, if necessary, flipped to match the effect alleles from the base dataset. This alignment ensures that the effect sizes are applied correctly. If effect alleles don't match as in the base dataset, these can be swapped using plink.
+
+```{bash, eval=FALSE, echo=TRUE}
+plink --bfile filtered_target_genotypes	--a2-allele base_snps.txt 5 1 --make-bed --out filtered_target_genotypes_swappedA2
+plink --bfile filtered_target_genotypes_swappedA2 --keep-allele-order --recode A --out genotypes
+```
+
+Check that the order matches in both base and target data.  
+
+```{r, echo=TRUE}
+# create a matching column for genotypes in the base df
+base[, SNP_genotype := paste0(SNP, "_", A1)] # e.g rsxx_G
+
+# filter the base file to include only SNPs that are present in the target data
+available_snps <- names(genotypes)[7:ncol(genotypes)]
+base <- base[SNP_genotype %in% available_snps]
+
+# Get the list of SNPs from the base file
+snp_genotype_names <- base$SNP_genotype
+
+# Select the genotype columns that match the SNPs
+genotype_columns <- which(names(genotypes) %in% snp_genotype_names)
+#length(genotype_columns)
+
+# Extract the genotypes and metadata
+genotype_data <- genotypes[, ..genotype_columns]
+metadata <- genotypes[, 1:6]
+
+# Ensure the order of SNPs in genotype_data matches the order in base
+setnames(genotype_data, old = names(genotype_data), new = snp_genotype_names)
+base <- base[order(base$SNP_genotype), ]
+head(base)
+genotype_data <- genotype_data[, base$SNP_genotype, with = FALSE]
+head(genotype_data)
+```
+#### Calculate PRS
+Polygenic risk scores are calculated by summing the product of the genotype score for each SNP and its corresponding effect size (log(OR)) from the base dataset.   
+```{r, echo=TRUE}
+# Function to calculate PRS for each individual
+calculate_prs <- function(genotype_row, betas) {
+  sum(genotype_row * betas, na.rm = TRUE)
+}
+
+# Apply the function to each individual (excluding metadata columns)
+prs <- apply(genotype_data, 1, calculate_prs, betas = base$beta)
+
+# Add PRS to the metadata dataframe
+metadata[, PRS := prs]
+head(metadata)
+```
+
+#### Standardising PRS
+The PRS values are standardized by subtracting the mean and dividing by the standard deviation of the PRS scores across the study population.
+
+```{r, echo=TRUE}
+metadata$PRSn = (metadata$PRS - mean(metadata$PRS)) / sd(metadata$PRS)
+head(metadata)
+```
+
+#### Association analysis
+A logistic regression model is fitted to assess the association between the standardized PRS and the phenotype, which is binary (i.e disease status).  
+First let's add the phenotype status data. 
+```{r, echo=TRUE}
+# merge with pheno df
+metadata <- merge(metadata, pheno, by = c("FID", "IID"), all.x = TRUE)
+metadata[, PHENOTYPE := pheno]
+
+# make phenotype as 0 and 1
+metadata[, PHENOTYPE := PHENOTYPE - 1]
+head(metadata)
+```
+Fitting a logistic regression (without adjusting for covariates):  
+
+```{r, echo=TRUE}
+model_noadj <- glm(PHENOTYPE ~ PRSn, data = metadata, family = binomial)
+summary(model_noadj)
+```
+Extracting the coefficients:  
+```{r, echo=TRUE}
+# coefficients
+coef_summary_noadj <- summary(model_noadj)$coefficients
+# odds ratios
+odds_ratios_noadj <- exp(coef_summary_noadj[, "Estimate"])
+# confidence intervals for the odds ratios
+conf_int_noadj <- exp(confint(model_noadj))
+
+# Combine the results 
+results_noadj <- data.frame(
+  Estimate = coef_summary_noadj[, "Estimate"],
+  Std.Error = coef_summary_noadj[, "Std. Error"],
+  Odds.Ratio = odds_ratios_noadj,
+  CI.Lower = conf_int_noadj[, 1],
+  CI.Upper = conf_int_noadj[, 2],
+  p.value = coef_summary_noadj[, "Pr(>|z|)"]
+)
+
+print(results_noadj)
+```
+Fitting a logistic regression and adjusting for covariates:  
+```{r, echo=TRUE}
+metadata_with_cov <- merge(metadata, cov, by = c("FID", "IID"), all.x = TRUE)
+# logistic regression
+model_adj<-glm(PHENOTYPE~PRSn+sex+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10,family=binomial,data=metadata_with_cov) 
+summary(model_adj)
+```
+Extracting the coefficients:  
+```{r, echo=TRUE}
+# coefficients
+coef_summary_adj <- summary(model_adj)$coefficients
+# odds ratios
+odds_ratios_adj <- exp(coef_summary_adj[, "Estimate"])
+# confidence intervals for the odds ratios
+conf_int_adj <- exp(confint(model_adj))
+
+# Combine the results 
+results_adj <- data.frame(
+  Estimate = coef_summary_adj[, "Estimate"],
+  Std.Error = coef_summary_adj[, "Std. Error"],
+  Odds.Ratio = odds_ratios_adj,
+  CI.Lower = conf_int_adj[, 1],
+  CI.Upper = conf_int_adj[, 2],
+  p.value = coef_summary_adj[, "Pr(>|z|)"]
+)
+
+print(results_adj)
+```
+
+#### Assessing model performance  
+The discriminatory power of the PRS is evaluated using Receiver Operating Characteristic (ROC) curve analysis and the Area Under the Curve (AUC). 
+PRS without covariates:  
+```{r, echo=TRUE}
+library(pROC)
+# Predict probabilities of the cases (PHENOTYPE = 1)
+predicted_noadj <- predict(model_noadj, type = "response")
+
+# ROC curve and AUC
+roc_curve_noadj <- roc(metadata$PHENOTYPE, predicted_noadj)
+paste("AUC:", auc(roc_curve_noadj))
+```
+PRS with covariates:  
+```{r, echo=TRUE}
+# Predict probabilities of the cases (PHENOTYPE = 1)
+predicted_adj <- predict(model_adj, type = "response")
+
+# ROC curve and AUC
+roc_curve_adj <- roc(metadata_with_cov$PHENOTYPE, predicted_adj)
+paste("AUC:", auc(roc_curve_adj))
+```
