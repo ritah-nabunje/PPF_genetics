@@ -13,15 +13,14 @@ knitr::opts_chunk$set(echo = TRUE)
 A polygenic risk score quantifies an individual's genetic risk for a disease based on the cumulative effect of multiple genetic variants.
 
 ```{r include=FALSE}
-setwd("/scratch/gen1/rn180/respiratory_fibrosis/pf_phenotypes/manual_PRS")
+setwd("/path/to/dir")
 library(data.table)
 library(pROC)
 # files
-base="/scratch/gen1/rn180/respiratory_fibrosis/prs/reportedb37b.assoc"
-base="/scratch/gen1/rn180/respiratory_fibrosis/prs/reportedb37b.assoc"
-target="hypersensitivityPF_all_swapped.raw"
-pheno_file="../matching_controls/hypersensitivityPF_all_cases_controls.pheno"
-cov_file="../matching_controls/hypersensitivityPF_all_cases_controls.cov"
+base="base.assoc"
+target="target.raw"
+pheno_file="target.pheno"
+cov_file="target.cov"
 # read
 base <- fread(base)
 genotypes <- fread(target)
